@@ -3,8 +3,34 @@
 #include <math.h>
 #include "energy_storms.h"
 
+#define BLOCKSIZE 256
+
+// Wrapper to CUDA calls, to show errors and avoid having to assign to a cudaError_t variable. 
+#define CUDA_CHECK(err) \
+    if (err != cudaSuccess) { \
+        fprintf(stderr, "CUDA error at %s:%d: %s\n", __FILE__, __LINE__, cudaGetErrorString(err)); \
+        exit(EXIT_FAILURE); \
+    }
+
+// TODO (to test overheads)
+// - precomputed lookup table for the sqrt 
+// - documentation of kernels
+// - remove the h_layer once all phases are parallelized 
+// - register accumulation for the bombardment phase, instead of N updates, update once global memory and accumulate N times on the thread. 
+// - loop the storms before the main loop, find the max particles and allocate once outside the loop with the MAX particles (avoid multiple allocations) 
+// - instead of doing -> CUDA_CHECK(cudaMemcpy(d_layer_copy, d_layer, sizeof(float) * layer_size, cudaMemcpyDeviceToDevice)); relaxation_kernel<<<grid, block>>>(d_layer_copy, d_layer, layer_size);
+//                    ...do a pointer swap in each storm iteration.
+
+/**
+ * Kernels with sh suffixed to the function name will make use of shared memory and try to optimize  
+ * performance. 
+ * 
+ */
+
+
 /* THIS FUNCTION CAN BE MODIFIED */
 /* Function to update a single position of the layer */
+__device__
 static void update( float *layer, int layer_size, int k, int pos, float energy ) {
     /* 1. Compute the absolute value of the distance between the
         impact position and the k-th position of the layer */
@@ -28,55 +54,121 @@ static void update( float *layer, int layer_size, int k, int pos, float energy )
 }
 
 
+
+////////////////////////////// Naive Memory Implementations ///////////////////////////////////////////////////////////////
+
+__global__
+void bombardment_kernel(float *d_layer, int layer_sz, int *d_particles, int particles_sz){
+    // Each thread is responsible of a layer cell  
+    int layer_idx = threadIdx.x + blockIdx.x * blockDim.x;
+    if (layer_idx >= layer_sz) return; // boundary check
+
+    // Update the layer cell for all particles in the storm
+
+    for (int i = 0; i < particles_sz; i++){
+        float energy = (float)d_particles[i*2 + 1] * 1000; // energy in thousandths of Joule
+        int position = d_particles[i*2]; // impact position
+
+        update(d_layer, layer_sz, layer_idx, position, energy);
+    }
+}
+
+__global__
+void relaxation_kernel(float *d_layer_copy, float *d_layer, int layer_sz){
+    // Each thread must update the output layer vector by taking into account
+    // itself, neighbour -1 and neighbour +1.
+    int layer_idx= threadIdx.x + blockIdx.x * blockDim.x;
+    if (layer_idx <= 0 || layer_idx >= layer_sz-1) {
+        d_layer[layer_idx] = d_layer_copy[layer_idx]; // first and last should be saved as they are 
+        return;
+    }
+
+    d_layer[layer_idx] = (d_layer_copy[layer_idx-1] + d_layer_copy[layer_idx] +  d_layer_copy[layer_idx+1]) / 3;
+}
+
+
+//////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////// 
+
+////////////////////////////// Shared Memory implementations ///////////////////////////////////////////////////////////////
+
+__global__
+void bombardment_kernelsh(){
+}
+
+__global__
+void relaxation_kernelsh(){
+    // load left / right ghost values from shared memory 
+}
+
+__global__
+void maxval_kernelsh(int layer_sz){
+   
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
 void core(int layer_size, int num_storms, Storm *storms, float *maximum, int *positions) {
-    int i, j, k;
-    /* 3. Allocate memory for the layer and initialize to zero */
-    float *layer = (float *)malloc( sizeof(float) * layer_size );
-    float *layer_copy = (float *)malloc( sizeof(float) * layer_size );
-    if ( layer == NULL || layer_copy == NULL ) {
+    int i, k;
+    float *h_layer = (float *)malloc( sizeof(float) * layer_size );
+    if (h_layer == NULL) {
         fprintf(stderr,"Error: Allocating the layer memory\n");
         exit( EXIT_FAILURE );
     }
-    for( k=0; k<layer_size; k++ ) layer[k] = 0.0f;
-    for( k=0; k<layer_size; k++ ) layer_copy[k] = 0.0f;
-    
+
+    float *d_layer;  float *d_layer_copy;
+    int *d_particles; // particles in a wave 
+
+    CUDA_CHECK(cudaMalloc(&d_layer, sizeof(float) * layer_size)); // one layer for the whole execution
+    CUDA_CHECK(cudaMalloc(&d_layer_copy, sizeof(float) * layer_size));
+    // CUDA_CHECK(cudaMemcpy(d_layer, h_layer, sizeof(float) * layer_size, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemset(d_layer, 0, sizeof(float) * layer_size)); // instead of memcpy of zeros 
+
+    dim3 block(BLOCKSIZE);
+    dim3 grid((layer_size + BLOCKSIZE -1) / BLOCKSIZE);
+
     /* 4. Storms simulation */
     for( i=0; i<num_storms; i++) {
+        //////////////////////////////////////////////////////////////////
+        // Bombardment Phase
+        CUDA_CHECK(cudaMalloc(&d_particles, sizeof(int) * storms[i].size * 2)); // one d_particles per wave (storm) 
+        CUDA_CHECK(cudaMemcpy(d_particles, storms[i].posval, sizeof(int) * storms[i].size * 2, cudaMemcpyHostToDevice));
 
-        /* 4.1. Add impacts energies to layer cells */
-        /* For each particle */
-        for( j=0; j<storms[i].size; j++ ) {
-            /* Get impact energy (expressed in thousandths) */
-            float energy = (float)storms[i].posval[j*2+1] * 1000;
-            /* Get impact position */
-            int position = storms[i].posval[j*2];
+        bombardment_kernel<<<grid, block>>>(d_layer, layer_size, d_particles, storms[i].size);
+        CUDA_CHECK(cudaGetLastError()); 
+        CUDA_CHECK(cudaDeviceSynchronize());  
+        //////////////////////////////////////////////////////////////////
 
-            /* For each cell in the layer */
-            for( k=0; k<layer_size; k++ ) {
-                /* Update the energy value for the cell */
-                update( layer, layer_size, k, position, energy );
-            }
-        }
+        //////////////////////////////////////////////////////////////////
+        // Relaxation Phase
+        CUDA_CHECK(cudaMemcpy(d_layer_copy, d_layer, sizeof(float) * layer_size, cudaMemcpyDeviceToDevice));
 
-        /* 4.2. Energy relaxation between storms */
-        /* 4.2.1. Copy values to the ancillary array */
-        for( k=0; k<layer_size; k++ ) 
-            layer_copy[k] = layer[k];
+        relaxation_kernel<<<grid, block>>>(d_layer_copy, d_layer, layer_size);
+        CUDA_CHECK(cudaGetLastError()); 
+        CUDA_CHECK(cudaDeviceSynchronize());  
 
-        /* 4.2.2. Update layer using the ancillary values.
-                  Skip updating the first and last positions */
-        for( k=1; k<layer_size-1; k++ )
-            layer[k] = ( layer_copy[k-1] + layer_copy[k] + layer_copy[k+1] ) / 3;
+        CUDA_CHECK(cudaMemcpy(h_layer, d_layer, sizeof(float) * layer_size, cudaMemcpyDeviceToHost));  // todo remove
+        //////////////////////////////////////////////////////////////////
 
+
+        //////////////////////////////////////////////////////////////////
+        // Maximum Value Location Phase 
         /* 4.3. Locate the maximum value in the layer, and its position */
-        for( k=1; k<layer_size-1; k++ ) {
+        for(k=1; k<layer_size-1; k++) {
             /* Check it only if it is a local maximum */
-            if ( layer[k] > layer[k-1] && layer[k] > layer[k+1] ) {
-                if ( layer[k] > maximum[i] ) {
-                    maximum[i] = layer[k];
+            if ( h_layer[k] > h_layer[k-1] && h_layer[k] > h_layer[k+1] ) {
+                if ( h_layer[k] > maximum[i] ) {
+                    maximum[i] = h_layer[k];
                     positions[i] = k;
                 }
             }
         }
+        //////////////////////////////////////////////////////////////////
+
+
+        //////////////////////////////////////////////////////////////////
+        // Cleanup
+        CUDA_CHECK(cudaFree(d_particles));
     }
+
+    CUDA_CHECK(cudaFree(d_layer));
 }
