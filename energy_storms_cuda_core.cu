@@ -15,7 +15,6 @@
 
 // TODO 
 // - documentation of kernels
-// - SoA for no LUT version shared mem bombardment 
 // - Should I disable L1 cache ? Checkthat 
 // - Where should I use Pinned Mem 
 // - Fare la reduction (vedi slide)
@@ -24,25 +23,12 @@
 // - Provare a modificare il valore di BLOCKSIZE
 
 // Improvements for comparison:
-// - LUT (+++)
-// - AoS -> SoA (++)
+// - AoS -> SoA (+++)
 // - Using __restrict__ (++)
 // - Find max particles per storm Pre Main Loop (+) 
 // - Pointer swap d_layer <-> d_layer_copy instead of DevToDev Memcpy (+)
 
-/**
- * This is a Parallel implementation of the waves program for the Multicore exam at Sapienza University of Rome.
- * The goal was to use CUDA to parallelize the code an gain higher performances. 
- * 
- * Notes:
- * - Kernels with sh suffixed to the function name will make use of shared memory. 
- * 
- * 
- */
 
-
-//////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////// 
-/////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////// 
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////// 
 /////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -57,22 +43,16 @@
 __device__
 static void update( 
     float *layer, 
-    int layer_size, 
+    int layer_sz, 
     int k, 
     int pos, 
     float energy ) 
 {
-    // Abs 
-    int distance = pos - k;
-    if ( distance < 0 ) distance = - distance;
-    distance = distance + 1;
-
-    float atenuacion = sqrtf( (float)distance );
-
-    float energy_k = energy / layer_size / atenuacion;
-
-    if ( energy_k >= THRESHOLD / layer_size || energy_k <= -THRESHOLD / layer_size )
-        layer[k] = layer[k] + energy_k;
+    int distance = abs(pos - k) + 1;
+    float attenuacion = sqrtf((float)distance);
+    float energy_k = energy / layer_sz / attenuacion;
+    if ( energy_k >= THRESHOLD / layer_sz || energy_k <= -THRESHOLD / layer_sz )
+        layer[k] += energy_k;
 }
 
 
@@ -86,15 +66,12 @@ int get_max_particles_count(
 {
     int max_p = 0;
     for (int i = 0; i < num_storms; i++) {
-        if (storms[i].size > max_p) {
+        if (storms[i].size > max_p)
             max_p = storms[i].size;
-        }
     }
     return max_p;
 }
 
-//////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////// 
-/////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////// 
 //////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 /////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -115,20 +92,19 @@ void bombardment_kernel(
     int particles_sz)
 {
     int layer_idx = threadIdx.x + blockIdx.x * blockDim.x;
-    if (layer_idx >= layer_sz) return; // boundary check
+    if (layer_idx >= layer_sz) return; 
 
     // Update the layer cell for all particles in the storm
     for (int i = 0; i < particles_sz; i++){
-        float energy = (float)d_particles[i*2 + 1] * 1000; // energy in thousandths of Joule
         int position = d_particles[i*2]; // impact position
+        float energy = (float)d_particles[i*2 + 1] * 1000.0f; // energy in thousandths of Joule
         update(d_layer, layer_sz, layer_idx, position, energy);
     }
 }
 
 /**
- * Like @bombardment_kernel_lut but using SoA.
- * Improvents @bombardment_kernel_lut version:
- * - using SoA allows for coalesced memory accesses, making this kernel much faster compared to the others. 
+ * Like @bombardment_kernel but using SoA.
+ * This is actually slower than the other one  
  */
 __global__ 
 __launch_bounds__(BLOCKSIZE)
@@ -137,36 +113,20 @@ void bombardment_kernel_soa(
     int layer_sz, 
     const int * __restrict__ d_particle_pos, 
     const int * __restrict__ d_particle_val, 
-    int particles_sz,
-    const float * __restrict__ d_sqrt_lut) 
+    int particles_sz)
 {
     int layer_idx = threadIdx.x + blockIdx.x * blockDim.x;
     if (layer_idx >= layer_sz) return;
 
-    float acc = 0.0f;
-    float threshold_scaled = THRESHOLD / layer_sz;
-
     for (int i = 0; i < particles_sz; i++) {
-        // Coalesced memory access! 
-        // Threads in a warp read consecutive memory locations.
-        int pos = d_particle_pos[i]; 
-        float energy = (float)d_particle_val[i] * 1000.0f / layer_sz;
-
-        int distance = pos - layer_idx;
-        if ( distance < 0 ) distance = - distance;
-        distance = distance + 1;
-
-        float energy_k = energy * d_sqrt_lut[distance];
-
-        if (energy_k >= threshold_scaled || energy_k <= -threshold_scaled) {
-            acc += energy_k;
-        }
+        int position = d_particle_pos[i]; 
+        float energy = (float)d_particle_val[i] * 1000.0f; 
+        update(d_layer, layer_sz, layer_idx, position, energy);
     }
-    d_layer[layer_idx] += acc;
 }
 
 /**
- * Simple relaxation phase management (no shared memory) -> Slowest implementation of the relaxation phase.
+ * Simple relaxation phase management (no shared memory).
  * Each thread will be responsible for a layer cell and calculate the average between itself & its 2 neighbours.
  * The 1st and last cells will just copy-paste their own value since they haven't both left & right neighbours. 
  */
@@ -187,8 +147,6 @@ void relaxation_kernel(
 }
 
 
-//////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////// 
-///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 //////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 /////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -197,7 +155,7 @@ void relaxation_kernel(
 
 
 /**
- * A more advanced bombardment phase management (using shared memory) -> Faster than @bombardment_kernel but slower than LUT and SoA versions.
+ * A more advanced bombardment phase management (using shared memory). 
  * Each thread will update the global memory and the input particles are in AoS format. 
  */
 __global__ 
@@ -236,6 +194,51 @@ void bombardment_kernelsh(
         __syncthreads(); 
     }
 }
+
+
+/**
+ * A more advanced bombardment phase management (using shared memory & SoA).
+ */
+__global__ 
+__launch_bounds__(BLOCKSIZE)
+void bombardment_kernelsh_soa(
+    float* __restrict__ d_layer, 
+    int layer_sz, 
+    const int * __restrict__ d_particle_pos, 
+    const int * __restrict__ d_particle_val, 
+    int particles_sz)
+{
+    __shared__ int sh_particle_pos[BLOCKSIZE];
+    __shared__ int sh_particle_val[BLOCKSIZE];
+
+    int layer_idx = threadIdx.x + blockIdx.x * blockDim.x;
+    if (layer_idx >= layer_sz) return;
+
+    for (int tile = 0; tile < particles_sz; tile += blockDim.x) {
+
+        int tidx = threadIdx.x;
+        int p = tile + tidx;
+
+        if (p < particles_sz) {
+            sh_particle_pos[tidx] = d_particle_pos[p];
+            sh_particle_val[tidx] = d_particle_val[p];
+        }
+
+        __syncthreads(); // avoid reads on shared mem when it's not fully filled 
+
+        int tile_size = min(blockDim.x, particles_sz - tile);
+
+        for (int j = 0; j < tile_size; j++) {
+            int position = sh_particle_pos[j];
+            float energy = (float)sh_particle_val[j] * 1000.0f;
+            update(d_layer, layer_sz, layer_idx, position, energy);
+        }
+
+        __syncthreads(); 
+    }
+}
+
+
 
 /**
  * A more advanced relaxation phase management (shared memory).
@@ -341,8 +344,6 @@ void maxval_kernelsh(
     }
 }
 
-////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 //////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 /////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -380,7 +381,6 @@ void core(
     size_t relax_shmem = (BLOCKSIZE + 2) * sizeof(float);
     size_t maxval_shmem = BLOCKSIZE * sizeof(float) + BLOCKSIZE * sizeof(int); 
 
-
     ///////////////////////// Maxval Alloc (start)
     float *d_block_max_vals;
     int *d_block_max_idxs; 
@@ -389,14 +389,6 @@ void core(
     float *h_block_vals = (float*)malloc(grid.x * sizeof(float));
     int *h_block_idxs = (int*)malloc(grid.x * sizeof(int));
     ///////////////////////// Maxval Alloc (end)
-
-    ///////////////////////// LUT Optimization (start)
-    float *d_sqrt_lut;
-    // We allocate layer_size + 1 to handle distances from 1 to layer_size
-    CUDA_CHECK(cudaMalloc(&d_sqrt_lut, sizeof(float) * (layer_size + 1)));
-    int lut_grid = (layer_size + 1 + BLOCKSIZE - 1) / BLOCKSIZE;
-    fill_sqrt_lut<<<lut_grid, BLOCKSIZE>>>(d_sqrt_lut, layer_size + 1);
-    ///////////////////////// LUT Optimization (end)
 
     ///////////////////////// Max Particles Optimization (start)
     int max_particles = get_max_particles_count(num_storms, storms);
@@ -409,14 +401,15 @@ void core(
     CUDA_CHECK(cudaMalloc(&d_particle_pos, sizeof(int) * max_particles));
     CUDA_CHECK(cudaMalloc(&d_particle_val, sizeof(int) * max_particles));
 
+    int *h_temp_pos; int *h_temp_val;
+
     // NON-PINNED MEMORY
-    // int *h_temp_pos = (int*)malloc(sizeof(int) * max_particles);
-    // int *h_temp_val = (int*)malloc(sizeof(int) * max_particles);
+    h_temp_pos = (int*)malloc(sizeof(int) * max_particles);
+    h_temp_val = (int*)malloc(sizeof(int) * max_particles);
 
     // PINNED MEMORY
-    int *h_temp_pos, *h_temp_val;
-    CUDA_CHECK(cudaMallocHost(&h_temp_pos, sizeof(int) * max_particles));
-    CUDA_CHECK(cudaMallocHost(&h_temp_val, sizeof(int) * max_particles));
+    // CUDA_CHECK(cudaMallocHost(&h_temp_pos, sizeof(int) * max_particles));
+    // CUDA_CHECK(cudaMallocHost(&h_temp_val, sizeof(int) * max_particles));
     ///////////////////////// AoS -> SoA Optimization (end)
 
 
@@ -428,39 +421,41 @@ void core(
         //////////////////////////////////////////////////////////////////
         // Bombardment Phase
 
-        ///////////////////////// AoS -> SoA Optimization (start)
-        // // Shuffle AoS -> SoA on CPU
-        // for (int p = 0; p < n_particles; p++) {
-        //     h_temp_pos[p] = storms[i].posval[p * 2];     // Position
-        //     h_temp_val[p] = storms[i].posval[p * 2 + 1]; // Value
-        // }
-        // CUDA_CHECK(cudaMemcpy(d_particle_pos, h_temp_pos, sizeof(int) * n_particles, cudaMemcpyHostToDevice));
-        // CUDA_CHECK(cudaMemcpy(d_particle_val, h_temp_val, sizeof(int) * n_particles, cudaMemcpyHostToDevice));
-        // bombardment_kernel_soa<<<grid, block>>>(d_layer, layer_size, d_particle_pos, d_particle_val, n_particles, d_sqrt_lut);
-        ///////////////////////// AoS -> SoA Optimization (end)
-
-        CUDA_CHECK(cudaMemcpy(d_particles, storms[i].posval, sizeof(int) * n_particles * 2, cudaMemcpyHostToDevice));
+        // ==== AoS Version
+        // CUDA_CHECK(cudaMemcpy(d_particles, storms[i].posval, sizeof(int) * n_particles * 2, cudaMemcpyHostToDevice));
         // bombardment_kernel<<<grid, block>>>(d_layer, layer_size, d_particles, storms[i].size);
         // bombardment_kernelsh<<<grid, block, bomb_shmem>>>(d_layer, layer_size, d_particles, storms[i].size);
-        // bombardment_kernel_lut<<<grid, block, bomb_shmem>>>(d_layer, layer_size, d_particles, n_particles, d_sqrt_lut);
+        // ====
+
+        // ==== SoA Version 
+        for (int p = 0; p < n_particles; p++) {
+            h_temp_pos[p] = storms[i].posval[p * 2];     // Position
+            h_temp_val[p] = storms[i].posval[p * 2 + 1]; // Value
+        }
+        CUDA_CHECK(cudaMemcpy(d_particle_pos, h_temp_pos, sizeof(int) * n_particles, cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_particle_val, h_temp_val, sizeof(int) * n_particles, cudaMemcpyHostToDevice));
+        // bombardment_kernel_soa<<<grid, block>>>(d_layer, layer_size, d_particle_pos, d_particle_val, n_particles); // no shared-mem (SoA)
+        bombardment_kernelsh_soa<<<grid, block>>>(d_layer, layer_size, d_particle_pos, d_particle_val, storms[i].size);
+        // ====
+
         CUDA_CHECK(cudaGetLastError()); 
         CUDA_CHECK(cudaDeviceSynchronize());  
         //////////////////////////////////////////////////////////////////
+
 
         //////////////////////////////////////////////////////////////////
         // Relaxation Phase
         // CUDA_CHECK(cudaMemcpy(d_layer_copy, d_layer, sizeof(float) * layer_size, cudaMemcpyDeviceToDevice));
-
         // relaxation_kernel<<<grid, block>>>(d_layer_copy, d_layer, layer_size);
         relaxation_kernelsh<<<grid, block, relax_shmem>>>(d_layer, d_layer_copy, layer_size);
+
         CUDA_CHECK(cudaGetLastError()); 
         CUDA_CHECK(cudaDeviceSynchronize());  
 
-        // POINTER SWAP (no memcpy before relaxation)
+        // Pointer Swap (no cudaMemcpy before relaxation phase)
         float *tmp = d_layer;
         d_layer = d_layer_copy;
         d_layer_copy = tmp;
-
         //////////////////////////////////////////////////////////////////
 
 
@@ -474,7 +469,7 @@ void core(
         CUDA_CHECK(cudaMemcpy(h_block_vals, d_block_max_vals, grid.x * sizeof(float), cudaMemcpyDeviceToHost));
         CUDA_CHECK(cudaMemcpy(h_block_idxs, d_block_max_idxs, grid.x * sizeof(int), cudaMemcpyDeviceToHost));
 
-        // 3. Final reduction on CPU (takes negligible time)
+        // 3. Final reduction on CPU 
         // We initialize current max to what is already in maximum[i] (usually 0)
         // or a very small number if maximum[i] isn't initialized.
         float current_max = -FLT_MAX; 
@@ -492,6 +487,7 @@ void core(
              positions[i] = current_pos;
         }
 
+        // ==== SEQ Version 
         // CUDA_CHECK(cudaMemcpy(h_layer, d_layer, sizeof(float) * layer_size, cudaMemcpyDeviceToHost));   
         // for(k=1; k<layer_size-1; k++) {
         //     if ( h_layer[k] > h_layer[k-1] && h_layer[k] > h_layer[k+1] ) {
@@ -501,6 +497,7 @@ void core(
         //         }
         //     }
         // }
+        // ==== 
         //////////////////////////////////////////////////////////////////
 
 
@@ -508,7 +505,7 @@ void core(
 
     //////////////////////////////////////////////////////////////////
     // Cleanup
-    CUDA_CHECK(cudaFree(d_particles));
+    // CUDA_CHECK(cudaFree(d_particles));
     CUDA_CHECK(cudaFree(d_layer));
     CUDA_CHECK(cudaFree(d_layer_copy));
     CUDA_CHECK(cudaFree(d_block_max_vals));
@@ -517,12 +514,12 @@ void core(
     free(h_block_idxs);
 
     // SoA Optimization (pinned)
-    CUDA_CHECK(cudaFreeHost(h_temp_pos));
-    CUDA_CHECK(cudaFreeHost(h_temp_val));
+    //CUDA_CHECK(cudaFreeHost(h_temp_pos));
+    //CUDA_CHECK(cudaFreeHost(h_temp_val));
 
     // SoA Optimization (non-pinned)
-    // free(h_temp_pos);
-    // free(h_temp_val);
+    free(h_temp_pos);
+    free(h_temp_val);
 
     // Sequential
     // free(h_layer);
