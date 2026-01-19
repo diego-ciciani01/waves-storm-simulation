@@ -52,6 +52,7 @@ void core(int layer_size, int num_storms, Storm *storms, float *maximum, int *po
     /* Let's define alse here the global comunicator and the rank variables */
     int rank, comm_sz;
     int i, j, k;
+    double t_start, t_comp, t_comm;
     struct reductionResult localResult, globalResult;
 
 
@@ -107,44 +108,52 @@ void core(int layer_size, int num_storms, Storm *storms, float *maximum, int *po
             local_layer_copy[k] = 0.0f;
         }
 
-        float inv_layer_size = 1.0f / (float)layer_size;
-        float threshold_val = THRESHOLD * inv_layer_size;
+        int max_size = 0;
+        #pragma omp parallel for schedule(static) reduction(max: max_size)
+        for (i=0; i<num_storms; i++){
+            if (storms[i].size > max_size)
+                max_size = storms[i].size;
+        }
+         // FUORI dal loop degli storm (alloca UNA VOLTA)
+        float *s_pos = malloc(max_size * sizeof(float));
+        float *s_en = malloc(max_size * sizeof(float));
+        if (s_pos == NULL || s_en == NULL){
+               fprintf(stderr,"Error: Allocating the local layer memory\n");
+               MPI_Abort(MPI_COMM_WORLD, EXIT_FAILURE);
+               exit( EXIT_FAILURE );
+        }
 
-        /* 4. Storms simulation */
-        for( i=0; i<num_storms; i++) {
-
-            /* 4.1. Add impacts energies to layer cells */
-            /* For each particle */
-            /* Here we've to changhe the update of control points, we want to avoid to use the critical section   */
+        float seq_threshold = THRESHOLD / (float)layer_size;
+        t_start = MPI_Wtime();
+        for(i = 0; i < num_storms; i++) {
             int s_size = storms[i].size;
 
-            // 2. DATA PACKING: Fondamentale per AMD EPYC
-            // Data for ancilliar, to sum all data in the end
-            float *s_pos = malloc(s_size * sizeof(float));
-            float *s_en = malloc(s_size * sizeof(float));
-
-            /* Valorziation of data, no parallel here, too slow */
-            for(int p=0; p<s_size; p++) {
-                s_pos[p] = (float)storms[i].posval[p*2];
-                s_en[p] = (float)storms[i].posval[p*2+1] * 1000.0f * inv_layer_size;
-            }
-            /* reduction for avoid unusefull branch prediction */
+            // Data packing
             #pragma omp parallel for schedule(static)
-            for (int k = 1; k < local_size; k++) {
-                float global_id = (float)(local_start + k - 1);
-                float acc = 0.0f;
-
-                #pragma omp simd reduction(+:acc)
-                for (int j = 0; j < s_size; j++) {
-                    float dist = fabsf(s_pos[j] - global_id) + 1.0f;
-                    float energy_k = s_en[j] / sqrtf(dist);
-
-                    acc += (fabsf(energy_k) >= threshold_val) ? energy_k : 0.0f;
-                }
-                local_layer[k] += acc;
+            for(int p = 0; p < s_size; p++) {
+                s_pos[p] = (float)storms[i].posval[p*2];
+                s_en[p] = (float)storms[i].posval[p*2+1] * 1000.0f;
             }
-            free(s_pos);
-            free(s_en);
+
+            // Loop parallelo
+            t_comp = MPI_Wtime();
+            #pragma omp parallel for schedule(static)
+            for (int k = 1; k <= local_size; k++) {
+                float global_id = (float)(local_start + k - 1);
+
+                for (int j = 0; j < s_size; j++) {
+                    float distance = fabsf(s_pos[j] - global_id);
+
+                    // VERIFICA QUESTA FORMULA CON IL SEQUENZIALE!
+                    float atenuacion = sqrtf(distance + 1.0f);
+                    float energy_k = s_en[j] / (float)layer_size / atenuacion;
+
+                    if (energy_k >= seq_threshold || energy_k <= -seq_threshold) {
+                        local_layer[k] += energy_k;
+                    }
+                }
+            }
+
 
              /*  We decide to use Sendrecv collective, to leverage it's self handling of send/recv
              *  Here we trat the halo exchange problem. Exchange the halo data between process
@@ -158,17 +167,19 @@ void core(int layer_size, int num_storms, Storm *storms, float *maximum, int *po
 
             if (rank > 0){
                 MPI_Isend(&local_layer[1], 1, MPI_FLOAT, rank - 1, 1, MPI_COMM_WORLD, &request[req_count++]);
-                MPI_Irecv(&local_layer[local_size+1], 1, MPI_FLOAT, rank - 1, 0, MPI_COMM_WORLD, &request[req_count++]);
+                MPI_Irecv(&local_layer[0], 1, MPI_FLOAT, rank - 1, 0, MPI_COMM_WORLD, &request[req_count++]);
 
             }if (rank < comm_sz - 1){
                 MPI_Isend(&local_layer[local_size], 1, MPI_FLOAT, rank + 1, 0, MPI_COMM_WORLD, &request[req_count++]);
-                MPI_Irecv(&local_layer[0], 1, MPI_FLOAT, rank + 1, 1, MPI_COMM_WORLD, &request[req_count++]);
+                MPI_Irecv(&local_layer[local_size +1], 1, MPI_FLOAT, rank + 1, 1, MPI_COMM_WORLD, &request[req_count++]);
             }
 
             /* MPI_Waitall: lets you to wait all the point - point comunication
              * It's necessary before to use the sanded data*/
-
+            t_start = MPI_Wtime();
             MPI_Waitall(req_count, request, MPI_STATUSES_IGNORE);
+            t_comp =MPI_Wtime();
+            if(rank == 0) printf("Tempo attesa MPI: %f di halo exchange\n", t_comp - t_start);
             /* Send the first right border element to the gosth cell  */
             /*
              * MPI_Sendrecv(&local_layer[1], 1, MPI_FLOAT, left_neighbor, 0, &local_layer[local_size + 1], 1, MPI_FLOAT, right_neighbor, 0, MPI_COMM_WORLD, &status);
@@ -196,12 +207,11 @@ void core(int layer_size, int num_storms, Storm *storms, float *maximum, int *po
                 for( k=1; k<local_size; k++ ){
                    local_layer[k] = ( local_layer_copy[k-1] + local_layer_copy[k] + local_layer_copy[k+1] ) / 3.0f;
                 }
-
-                /* 4.3. Locate the maximum value in the layer, and its position */
+                /*4.3. Locate the maximum value in the layer, and its position */
                float thread_max = -FLT_MAX;
                int thread_max_pos = -1;
                #pragma omp for schedule(static) nowait
-                for( k=1; k<local_size; k++ ) {
+                for( k=1; k<local_size-1; k++ ) {
                     /* Check it only if it is a local maximum */
                     if ( local_layer[k] > local_layer[k-1] && local_layer[k] > local_layer[k+1] ) {
                         if ( local_layer[k] > thread_max ) {
@@ -224,7 +234,12 @@ void core(int layer_size, int num_storms, Storm *storms, float *maximum, int *po
 
             /* For this reduction we decide to use MPI_FLOAT_INT to get a dedicated struct, to save result and position
              * MPI_MAXLOC: execute reduction, and get the index*/
+            t_comm = MPI_Wtime();
             MPI_Allreduce(&localResult, &globalResult, 1, MPI_FLOAT_INT, MPI_MAXLOC, MPI_COMM_WORLD);
+            if(rank ==0)
+                printf("Rank %d: Calcolo = %f s, Comunicazione = %f s\n", rank, t_comm - t_comp, MPI_Wtime() - t_comm);
+
+
             maximum[i] = globalResult.val;
             positions[i] = globalResult.pos;
 
@@ -237,7 +252,8 @@ void core(int layer_size, int num_storms, Storm *storms, float *maximum, int *po
     }
         free(local_layer);
         free(local_layer_copy);
-
+         free(s_pos);
+        free(s_en);
         if (rank == 0){
             free(displs);
             free(recvcounts);
