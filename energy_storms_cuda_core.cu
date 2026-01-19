@@ -52,8 +52,7 @@ static void update(
     float attenuacion = sqrtf((float)distance);
     float energy_k = energy / layer_sz / attenuacion;
     if ( energy_k >= THRESHOLD / layer_sz || energy_k <= -THRESHOLD / layer_sz )
-        // layer[k] += energy_k;
-        atomicAdd(&layer[k], energy_k);
+        layer[k] += energy_k;
 }
 
 
