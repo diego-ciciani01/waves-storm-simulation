@@ -8,9 +8,9 @@ set -u
 # ---------------------------
 BINARY=""
 TESTS_DIR="test_files"
-EXPECTED_DIR="expected"
-RESULTS_DIR="results"
-CONFIG_FILE="tests.cfg"
+EXPECTED_DIR="mytests/expected"
+RESULTS_DIR="mytests/results"
+CONFIG_FILE="mytests/tests.cfg"
 RECORD=0
 TIMEOUT_SECS=0
 
