@@ -250,99 +250,81 @@ void bombardment_kernelsh_soa(
  * Improvements over @relaxation_kernel:
  * - using shared memory prevents reading from global memory 
  */
-__global__ 
+ __global__
 __launch_bounds__(BLOCKSIZE)
 void relaxation_kernelsh(
-    const float* __restrict__ d_layer_in, 
-    float* __restrict__ d_layer_out, 
-    int layer_sz) 
+    const float* __restrict__ d_layer_in,
+    float* __restrict__ d_layer_out,
+    int layer_sz)
 {
     extern __shared__ float sh[];
 
     int global_idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int local_idx = threadIdx.x + 1;  // +1 because sh[0] is left ghost
+    int local_idx  = threadIdx.x + 1;
 
-    // own thread value loading 
-    if (global_idx < layer_sz)
-        sh[local_idx] = d_layer_in[global_idx];
+    // 🚫 EXIT EARLY — before touching shared memory
+    if (global_idx >= layer_sz) return;
 
-    // left ghost loading
+    // load own value
+    sh[local_idx] = d_layer_in[global_idx];
+
+    // left ghost
     if (threadIdx.x == 0 && global_idx > 0)
         sh[0] = d_layer_in[global_idx - 1];
 
-    // right ghost loading
+    // right ghost
     if (threadIdx.x == blockDim.x - 1 && global_idx < layer_sz - 1)
         sh[local_idx + 1] = d_layer_in[global_idx + 1];
 
-    __syncthreads(); // ensures shared memory is filled before accessing it. 
+    __syncthreads();
 
-    if (global_idx >= layer_sz) return; // out of bounds
-
-    // just copy first & last
-    if (global_idx == 0 || global_idx == layer_sz - 1){
+    if (global_idx == 0 || global_idx == layer_sz - 1) {
         d_layer_out[global_idx] = d_layer_in[global_idx];
         return;
     }
 
-    d_layer_out[global_idx] = (sh[local_idx - 1] + sh[local_idx] + sh[local_idx + 1]) / 3.0f;
+    d_layer_out[global_idx] =
+        (sh[local_idx - 1] + sh[local_idx] + sh[local_idx + 1]) / 3.0f;
 }
-
-
 
 // __global__ 
 // __launch_bounds__(BLOCKSIZE)
-// void maxval_kernelsh(
-//     float* __restrict__ d_layer, 
-//     int layer_sz, 
-//     float* __restrict__ d_block_vals, 
-//     int* __restrict__ d_block_idxs) 
+// void relaxation_kernelsh(
+//     const float* __restrict__ d_layer_in, 
+//     float* __restrict__ d_layer_out, 
+//     int layer_sz) 
 // {
-//     // Shared memory to store values and indices
-//     extern __shared__ float s_vals[];
-//     int* s_idxs = (int*)&s_vals[blockDim.x];
+//     extern __shared__ float sh[];
 
-//     int tid = threadIdx.x;
 //     int global_idx = blockIdx.x * blockDim.x + threadIdx.x;
+//     int local_idx = threadIdx.x + 1;  // +1 because sh[0] is left ghost
 
-//     // 1. Initialize local max to very small number
-//     float my_val = -FLT_MAX;
-//     int my_idx = -1;
+//     // own thread value loading 
+//     if (global_idx < layer_sz)
+//         sh[local_idx] = d_layer_in[global_idx];
 
-//     // 2. Filter: Check "Local Peak" condition (val > left and val > right)
-//     // Matches logic: for(k=1; k<layer_size-1; k++)
-//     if (global_idx > 0 && global_idx < layer_sz - 1) {
-//         float val = d_layer[global_idx];
-//         float left = d_layer[global_idx - 1];
-//         float right = d_layer[global_idx + 1];
+//     // left ghost loading
+//     if (threadIdx.x == 0 && global_idx > 0)
+//         sh[0] = d_layer_in[global_idx - 1];
 
-//         if (val > left && val > right) {
-//             my_val = val;
-//             my_idx = global_idx;
-//         }
+//     // right ghost loading
+//     if (threadIdx.x == blockDim.x - 1 && global_idx < layer_sz - 1)
+//         sh[local_idx + 1] = d_layer_in[global_idx + 1];
+
+//     __syncthreads(); // ensures shared memory is filled before accessing it. 
+
+//     if (global_idx >= layer_sz) return; // out of bounds
+
+//     // just copy first & last
+//     if (global_idx == 0 || global_idx == layer_sz - 1){
+//         d_layer_out[global_idx] = d_layer_in[global_idx];
+//         return;
 //     }
 
-//     // Load into shared memory
-//     s_vals[tid] = my_val;
-//     s_idxs[tid] = my_idx;
-//     __syncthreads();
-
-//     // 3. Reduction in Shared Memory
-//     for (unsigned int s = blockDim.x / 2; s > 0; s >>= 1) {
-//         if (tid < s) {
-//             if (s_vals[tid + s] > s_vals[tid]) {
-//                 s_vals[tid] = s_vals[tid + s];
-//                 s_idxs[tid] = s_idxs[tid + s];
-//             }
-//         }
-//         __syncthreads();
-//     }
-
-//     // 4. Write result for this block to global memory
-//     if (tid == 0) {
-//         d_block_vals[blockIdx.x] = s_vals[0];
-//         d_block_idxs[blockIdx.x] = s_idxs[0];
-//     }
+//     d_layer_out[global_idx] = (sh[local_idx - 1] + sh[local_idx] + sh[local_idx + 1]) / 3.0f;
 // }
+
+
 
 __global__ 
 __launch_bounds__(BLOCKSIZE)
@@ -364,6 +346,7 @@ void maxval_kernelsh(
     int my_idx = -1;
 
     // 2. Filter: Check "Local Peak" condition (val > left and val > right)
+    // Matches logic: for(k=1; k<layer_size-1; k++)
     if (global_idx > 0 && global_idx < layer_sz - 1) {
         float val = d_layer[global_idx];
         float left = d_layer[global_idx - 1];
@@ -381,15 +364,11 @@ void maxval_kernelsh(
     __syncthreads();
 
     // 3. Reduction in Shared Memory
-    // FIX: Use volatile to ensure visibility on Fermi architecture
-    volatile float* v_s_vals = s_vals;
-    volatile int* v_s_idxs = s_idxs;
-
     for (unsigned int s = blockDim.x / 2; s > 0; s >>= 1) {
         if (tid < s) {
-            if (v_s_vals[tid + s] > v_s_vals[tid]) {
-                v_s_vals[tid] = v_s_vals[tid + s];
-                v_s_idxs[tid] = v_s_idxs[tid + s];
+            if (s_vals[tid + s] > s_vals[tid]) {
+                s_vals[tid] = s_vals[tid + s];
+                s_idxs[tid] = s_idxs[tid + s];
             }
         }
         __syncthreads();
@@ -397,8 +376,8 @@ void maxval_kernelsh(
 
     // 4. Write result for this block to global memory
     if (tid == 0) {
-        d_block_vals[blockIdx.x] = v_s_vals[0]; // Read from volatile
-        d_block_idxs[blockIdx.x] = v_s_idxs[0]; // Read from volatile
+        d_block_vals[blockIdx.x] = s_vals[0];
+        d_block_idxs[blockIdx.x] = s_idxs[0];
     }
 }
 
