@@ -448,17 +448,17 @@ void core(
 
         //////////////////////////////////////////////////////////////////
         // Relaxation Phase
-        // CUDA_CHECK(cudaMemcpy(d_layer_copy, d_layer, sizeof(float) * layer_size, cudaMemcpyDeviceToDevice));
-        // relaxation_kernel<<<grid, block>>>(d_layer_copy, d_layer, layer_size);
-        relaxation_kernelsh<<<grid, block, relax_shmem>>>(d_layer, d_layer_copy, layer_size);
+        CUDA_CHECK(cudaMemcpy(d_layer_copy, d_layer, sizeof(float) * layer_size, cudaMemcpyDeviceToDevice));
+        relaxation_kernel<<<grid, block>>>(d_layer_copy, d_layer, layer_size);
+        // relaxation_kernelsh<<<grid, block, relax_shmem>>>(d_layer, d_layer_copy, layer_size);
 
         CUDA_CHECK(cudaGetLastError()); 
         CUDA_CHECK(cudaDeviceSynchronize());  
 
         // Pointer Swap (no cudaMemcpy before relaxation phase)
-        float *tmp = d_layer;
-        d_layer = d_layer_copy;
-        d_layer_copy = tmp;
+        // float *tmp = d_layer;
+        // d_layer = d_layer_copy;
+        // d_layer_copy = tmp;
         //////////////////////////////////////////////////////////////////
 
 
