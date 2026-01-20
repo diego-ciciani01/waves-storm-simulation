@@ -267,11 +267,11 @@ void relaxation_kernelsh(
         sh[local_idx] = d_layer_in[global_idx];
 
     // left ghost loading
-    if (threadIdx.x == 0 && global_idx > 0)
+    if (threadIdx.x == 0 && global_idx >= 1)
         sh[0] = d_layer_in[global_idx - 1];
 
     // right ghost loading
-    if (threadIdx.x == blockDim.x - 1 && global_idx < layer_sz - 1)
+    if (threadIdx.x == blockDim.x - 1 && global_idx <= layer_sz - 2)
         sh[local_idx + 1] = d_layer_in[global_idx + 1];
 
     __syncthreads(); // ensures shared memory is filled before accessing it. 
@@ -286,8 +286,6 @@ void relaxation_kernelsh(
 
     d_layer_out[global_idx] = (sh[local_idx - 1] + sh[local_idx] + sh[local_idx + 1]) / 3.0f;
 }
-
-
 
 __global__ 
 __launch_bounds__(BLOCKSIZE)
@@ -361,18 +359,25 @@ void core(
     float *maximum, 
     int *positions) 
 {
-    int i;
+    int i, k;
+    float *h_layer;
+
+    bool useSoA = true; 
+    bool usePinnedMemory = true;
+    bool useBombardmentSharedMem = true;
+    bool useRelaxationSharedMem = true;
+    bool useMaxvalSequential = false;
 
     // Sequential code 
-    // int k; 
-    // float *h_layer = (float *)malloc( sizeof(float) * layer_size );
-    // if (h_layer == NULL) {
-    //     fprintf(stderr,"Error: Allocating the layer memory\n");
-    //     exit( EXIT_FAILURE );
-    // }
+    if (useMaxvalSequential){
+        h_layer = (float *)malloc(sizeof(float) * layer_size);
+        if (h_layer == NULL) {
+            fprintf(stderr,"Error: Allocating the layer memory\n");
+            exit(EXIT_FAILURE);
+        }
+    }
 
     float *d_layer;  float *d_layer_copy;
-
     CUDA_CHECK(cudaMalloc(&d_layer, sizeof(float) * layer_size)); // one layer for the whole execution
     CUDA_CHECK(cudaMalloc(&d_layer_copy, sizeof(float) * layer_size));
     CUDA_CHECK(cudaMemset(d_layer, 0, sizeof(float) * layer_size));  // avoid the previous looping for initialization
@@ -385,12 +390,14 @@ void core(
     size_t maxval_shmem = BLOCKSIZE * sizeof(float) + BLOCKSIZE * sizeof(int); 
 
     ///////////////////////// Maxval Alloc (start)
-    float *d_block_max_vals;
-    int *d_block_max_idxs; 
-    CUDA_CHECK(cudaMalloc(&d_block_max_vals, grid.x * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&d_block_max_idxs, grid.x * sizeof(int)));
-    float *h_block_vals = (float*)malloc(grid.x * sizeof(float));
-    int *h_block_idxs = (int*)malloc(grid.x * sizeof(int));
+    float *d_block_max_vals; int *d_block_max_idxs; 
+    float *h_block_vals; int *h_block_idxs;
+    if (!useMaxvalSequential){
+        CUDA_CHECK(cudaMalloc(&d_block_max_vals, grid.x * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&d_block_max_idxs, grid.x * sizeof(int)));
+        h_block_vals = (float*)malloc(grid.x * sizeof(float));
+        h_block_idxs = (int*)malloc(grid.x * sizeof(int));
+    }
     ///////////////////////// Maxval Alloc (end)
 
     ///////////////////////// Max Particles Optimization (start)
@@ -399,20 +406,24 @@ void core(
     CUDA_CHECK(cudaMalloc(&d_particles, sizeof(int) * max_particles * 2));
     ///////////////////////// Max Particles Optimization (end)
 
-    ///////////////////////// AoS -> SoA Optimization (start)
     int *d_particle_pos; int *d_particle_val; 
-    CUDA_CHECK(cudaMalloc(&d_particle_pos, sizeof(int) * max_particles));
-    CUDA_CHECK(cudaMalloc(&d_particle_val, sizeof(int) * max_particles));
-
     int *h_temp_pos; int *h_temp_val;
+    ///////////////////////// AoS -> SoA Optimization (start)
+    if (useSoA){
+        CUDA_CHECK(cudaMalloc(&d_particle_pos, sizeof(int) * max_particles));
+        CUDA_CHECK(cudaMalloc(&d_particle_val, sizeof(int) * max_particles));
 
-    // NON-PINNED MEMORY
-    h_temp_pos = (int*)malloc(sizeof(int) * max_particles);
-    h_temp_val = (int*)malloc(sizeof(int) * max_particles);
 
-    // PINNED MEMORY
-    // CUDA_CHECK(cudaMallocHost(&h_temp_pos, sizeof(int) * max_particles));
-    // CUDA_CHECK(cudaMallocHost(&h_temp_val, sizeof(int) * max_particles));
+        if (!usePinnedMemory){
+            // NON-PINNED MEMORY
+            h_temp_pos = (int*)malloc(sizeof(int) * max_particles);
+            h_temp_val = (int*)malloc(sizeof(int) * max_particles);
+        } else {
+            // PINNED MEMORY
+            CUDA_CHECK(cudaMallocHost(&h_temp_pos, sizeof(int) * max_particles));
+            CUDA_CHECK(cudaMallocHost(&h_temp_val, sizeof(int) * max_particles));
+        }
+    }
     ///////////////////////// AoS -> SoA Optimization (end)
 
 
@@ -425,20 +436,24 @@ void core(
         // Bombardment Phase
 
         // ==== AoS Version
-        // CUDA_CHECK(cudaMemcpy(d_particles, storms[i].posval, sizeof(int) * n_particles * 2, cudaMemcpyHostToDevice));
-        // bombardment_kernel<<<grid, block>>>(d_layer, layer_size, d_particles, storms[i].size);
-        // bombardment_kernelsh<<<grid, block, bomb_shmem>>>(d_layer, layer_size, d_particles, storms[i].size);
+        if (!useSoA){
+            CUDA_CHECK(cudaMemcpy(d_particles, storms[i].posval, sizeof(int) * n_particles * 2, cudaMemcpyHostToDevice));
+            if (!useBombardmentSharedMem) bombardment_kernel<<<grid, block>>>(d_layer, layer_size, d_particles, storms[i].size);
+            else bombardment_kernelsh<<<grid, block, bomb_shmem>>>(d_layer, layer_size, d_particles, storms[i].size);
+        }
         // ====
 
         // ==== SoA Version 
-        for (int p = 0; p < n_particles; p++) {
-            h_temp_pos[p] = storms[i].posval[p * 2];     // Position
-            h_temp_val[p] = storms[i].posval[p * 2 + 1]; // Value
+        if (useSoA){
+            for (int p = 0; p < n_particles; p++) {
+                h_temp_pos[p] = storms[i].posval[p * 2];     // Position
+                h_temp_val[p] = storms[i].posval[p * 2 + 1]; // Value
+            }
+            CUDA_CHECK(cudaMemcpy(d_particle_pos, h_temp_pos, sizeof(int) * n_particles, cudaMemcpyHostToDevice));
+            CUDA_CHECK(cudaMemcpy(d_particle_val, h_temp_val, sizeof(int) * n_particles, cudaMemcpyHostToDevice));
+            if (!useBombardmentSharedMem) bombardment_kernel_soa<<<grid, block>>>(d_layer, layer_size, d_particle_pos, d_particle_val, n_particles); // no shared-mem (SoA)
+            else bombardment_kernelsh_soa<<<grid, block>>>(d_layer, layer_size, d_particle_pos, d_particle_val, storms[i].size);
         }
-        CUDA_CHECK(cudaMemcpy(d_particle_pos, h_temp_pos, sizeof(int) * n_particles, cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaMemcpy(d_particle_val, h_temp_val, sizeof(int) * n_particles, cudaMemcpyHostToDevice));
-        // bombardment_kernel_soa<<<grid, block>>>(d_layer, layer_size, d_particle_pos, d_particle_val, n_particles); // no shared-mem (SoA)
-        bombardment_kernelsh_soa<<<grid, block>>>(d_layer, layer_size, d_particle_pos, d_particle_val, storms[i].size);
         // ====
 
         CUDA_CHECK(cudaGetLastError()); 
@@ -448,10 +463,11 @@ void core(
 
         //////////////////////////////////////////////////////////////////
         // Relaxation Phase
-        // CUDA_CHECK(cudaMemcpy(d_layer_copy, d_layer, sizeof(float) * layer_size, cudaMemcpyDeviceToDevice));
+        // CUDA_CHECK(cudaMemcpy(d_layer_copy, d_layer, sizeof(float) * layer_size, cudaMemcpyDeviceToDevice)); 
         // relaxation_kernel<<<grid, block>>>(d_layer_copy, d_layer, layer_size);
-        relaxation_kernel<<<grid, block>>>(d_layer, d_layer_copy, layer_size);
-        // relaxation_kernelsh<<<grid, block, relax_shmem>>>(d_layer, d_layer_copy, layer_size);
+
+        if (!useRelaxationSharedMem) relaxation_kernel<<<grid, block>>>(d_layer, d_layer_copy, layer_size);
+        else relaxation_kernelsh<<<grid, block, relax_shmem>>>(d_layer, d_layer_copy, layer_size);
 
         CUDA_CHECK(cudaGetLastError()); 
         CUDA_CHECK(cudaDeviceSynchronize());  
@@ -465,43 +481,44 @@ void core(
 
         //////////////////////////////////////////////////////////////////
         // Maximum Value Location Phase 
-        maxval_kernelsh<<<grid, block, maxval_shmem>>>(d_layer, layer_size, d_block_max_vals, d_block_max_idxs);
-        CUDA_CHECK(cudaGetLastError());
-        CUDA_CHECK(cudaDeviceSynchronize());
+        if (!useMaxvalSequential) {
+            maxval_kernelsh<<<grid, block, maxval_shmem>>>(d_layer, layer_size, d_block_max_vals, d_block_max_idxs);
+            CUDA_CHECK(cudaGetLastError());
+            CUDA_CHECK(cudaDeviceSynchronize());
 
-        // 2. Copy partial block results back to CPU
-        CUDA_CHECK(cudaMemcpy(h_block_vals, d_block_max_vals, grid.x * sizeof(float), cudaMemcpyDeviceToHost));
-        CUDA_CHECK(cudaMemcpy(h_block_idxs, d_block_max_idxs, grid.x * sizeof(int), cudaMemcpyDeviceToHost));
+            // Partial results
+            CUDA_CHECK(cudaMemcpy(h_block_vals, d_block_max_vals, grid.x * sizeof(float), cudaMemcpyDeviceToHost));
+            CUDA_CHECK(cudaMemcpy(h_block_idxs, d_block_max_idxs, grid.x * sizeof(int), cudaMemcpyDeviceToHost));
 
-        // 3. Final reduction on CPU 
-        // We initialize current max to what is already in maximum[i] (usually 0)
-        // or a very small number if maximum[i] isn't initialized.
-        float current_max = -FLT_MAX; 
-        int current_pos = -1;
+            // Final reduction on CPU 
+            float current_max = -FLT_MAX; 
+            int current_pos = -1;
 
-        for(int b = 0; b < grid.x; b++) {
-            if (h_block_vals[b] > current_max) {
-                current_max = h_block_vals[b];
-                current_pos = h_block_idxs[b];
+            for(int b = 0; b < grid.x; b++) {
+                if (h_block_vals[b] > current_max) {
+                    current_max = h_block_vals[b];
+                    current_pos = h_block_idxs[b];
+                }
             }
-        }
         
-        if (current_pos != -1) {
-             maximum[i] = current_max;
-             positions[i] = current_pos;
-        }
+            if (current_pos != -1) {
+                 maximum[i] = current_max;
+                 positions[i] = current_pos;
+            }
+        } else {
 
         // ==== SEQ Version 
-        // CUDA_CHECK(cudaMemcpy(h_layer, d_layer, sizeof(float) * layer_size, cudaMemcpyDeviceToHost));   
-        // for(k=1; k<layer_size-1; k++) {
-        //     if ( h_layer[k] > h_layer[k-1] && h_layer[k] > h_layer[k+1] ) {
-        //         if ( h_layer[k] > maximum[i] ) {
-        //             maximum[i] = h_layer[k];
-        //             positions[i] = k;
-        //         }
-        //     }
-        // }
+            CUDA_CHECK(cudaMemcpy(h_layer, d_layer, sizeof(float) * layer_size, cudaMemcpyDeviceToHost));   
+            for(k=1; k<layer_size-1; k++) {
+                if ( h_layer[k] > h_layer[k-1] && h_layer[k] > h_layer[k+1] ) {
+                    if ( h_layer[k] > maximum[i] ) {
+                        maximum[i] = h_layer[k];
+                        positions[i] = k;
+                    }
+                }
+            }
         // ==== 
+        }
         //////////////////////////////////////////////////////////////////
 
 
@@ -509,22 +526,28 @@ void core(
 
     //////////////////////////////////////////////////////////////////
     // Cleanup
-    // CUDA_CHECK(cudaFree(d_particles));
+    if (!useSoA){
+        CUDA_CHECK(cudaFree(d_particles));
+    }
+
     CUDA_CHECK(cudaFree(d_layer));
     CUDA_CHECK(cudaFree(d_layer_copy));
-    CUDA_CHECK(cudaFree(d_block_max_vals));
-    CUDA_CHECK(cudaFree(d_block_max_idxs));
-    free(h_block_vals);
-    free(h_block_idxs);
 
-    // SoA Optimization (pinned)
-    //CUDA_CHECK(cudaFreeHost(h_temp_pos));
-    //CUDA_CHECK(cudaFreeHost(h_temp_val));
+    if (!useMaxvalSequential){
+        CUDA_CHECK(cudaFree(d_block_max_vals));
+        CUDA_CHECK(cudaFree(d_block_max_idxs));
+        free(h_block_vals);
+        free(h_block_idxs);
+    } else {
+        free(h_layer);
+    }
 
-    // SoA Optimization (non-pinned)
-    free(h_temp_pos);
-    free(h_temp_val);
+    if (usePinnedMemory && useSoA){
+        CUDA_CHECK(cudaFreeHost(h_temp_pos));
+        CUDA_CHECK(cudaFreeHost(h_temp_val));
+    } else if (useSoA && !usePinnedMemory){
+        free(h_temp_pos);
+        free(h_temp_val);
+    }
 
-    // Sequential
-    // free(h_layer);
 }
