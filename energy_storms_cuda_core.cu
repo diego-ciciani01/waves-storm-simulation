@@ -246,7 +246,7 @@ void relaxation_kernelsh(
     float* __restrict__ d_layer_out, 
     int layer_sz) 
 {
-    extern __shared__ float sh[];
+    __shared__ float sh[BLOCKSIZE + 2];
 
     int global_idx = blockIdx.x * blockDim.x + threadIdx.x;
     int local_idx = threadIdx.x + 1;  // +1 because sh[0] is left ghost
@@ -284,39 +284,33 @@ void maxval_kernelsh(
     float* __restrict__ d_block_vals, 
     int* __restrict__ d_block_idxs) 
 {
-    // Shared memory to store values and indices
-    // extern __shared__ float s_vals[];
-    // int* s_idxs = (int*)&s_vals[blockDim.x];
-    extern __shared__ char smem[];
-    float* s_vals = (float*)smem;
+    extern __shared__ char sh[];
+    float* s_vals = (float*)sh;
     int* s_idxs = (int*)(s_vals + blockDim.x);
 
     int tid = threadIdx.x;
-    int global_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int gid = blockIdx.x * blockDim.x + threadIdx.x;
 
-    // 1. Initialize local max to very small number
-    float my_val = -FLT_MAX;
-    int my_idx = -1;
+    float local_val = -FLT_MAX;
+    int local_idx = -1;
 
-    // 2. Filter: Check "Local Peak" condition (val > left and val > right)
-    // Matches logic: for(k=1; k<layer_size-1; k++)
-    if (global_idx > 0 && global_idx < layer_sz - 1) {
-        float val = d_layer[global_idx];
-        float left = d_layer[global_idx - 1];
-        float right = d_layer[global_idx + 1];
+    // Consider only local max  
+    if (gid > 0 && gid < layer_sz - 1) {
+        float val = d_layer[gid];
+        float left = d_layer[gid - 1];
+        float right = d_layer[gid + 1];
 
         if (val > left && val > right) {
-            my_val = val;
-            my_idx = global_idx;
+            local_val = val;
+            local_idx = gid;
         }
     }
 
-    // Load into shared memory
-    s_vals[tid] = my_val;
-    s_idxs[tid] = my_idx;
+    s_vals[tid] = local_val;
+    s_idxs[tid] = local_idx;
     __syncthreads();
 
-    // 3. Reduction in Shared Memory
+    // Reduction 
     for (unsigned int s = blockDim.x / 2; s > 0; s >>= 1) {
         if (tid < s) {
             if (s_vals[tid + s] > s_vals[tid]) {
@@ -327,13 +321,12 @@ void maxval_kernelsh(
         __syncthreads();
     }
 
-    // 4. Write result for this block to global memory
+    // Write back to memory for this block 
     if (tid == 0) {
         d_block_vals[blockIdx.x] = s_vals[0];
         d_block_idxs[blockIdx.x] = s_idxs[0];
     }
 }
-
 
 //////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 /////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -355,9 +348,9 @@ void core(
     bool useSoA = true; // optimal: true
     bool useSoaPinnedMemory = true; // optimal: true
     bool useBombardmentSharedMem = true; // optimal: true
-    bool useRelaxationSharedMem = false; // optimal: false (no real changes)
-    bool useRelaxationSwap = false; // optimal: false (no real changes on gtx970)
-    bool useMaxvalSequential = true; // optimal: true (no real changes on gtx970)
+    bool useRelaxationSharedMem = true; // optimal: false (no real changes)
+    bool useRelaxationSwap = true; // optimal: false (no real changes on gtx970)
+    bool useMaxvalSequential = false; // optimal: true (no real changes on gtx970)
 
     // Sequential code 
     if (useMaxvalSequential){
@@ -377,7 +370,6 @@ void core(
     dim3 block(BLOCKSIZE);
     dim3 grid((layer_size + BLOCKSIZE -1) / BLOCKSIZE);
     size_t bomb_shmem = 2 * BLOCKSIZE * sizeof(int);
-    size_t relax_shmem = (BLOCKSIZE + 2) * sizeof(float);
     size_t maxval_shmem = BLOCKSIZE * sizeof(float) + BLOCKSIZE * sizeof(int); 
 
     ///////////////////////// Maxval Alloc (start)
@@ -456,10 +448,10 @@ void core(
         if (!useRelaxationSwap){
             CUDA_CHECK(cudaMemcpy(d_layer_copy, d_layer, sizeof(float) * layer_size, cudaMemcpyDeviceToDevice)); 
             if (!useRelaxationSharedMem) relaxation_kernel<<<grid, block>>>(d_layer_copy, d_layer, layer_size);
-            else relaxation_kernelsh<<<grid, block, relax_shmem>>>(d_layer_copy, d_layer, layer_size);
+            else relaxation_kernelsh<<<grid, block>>>(d_layer_copy, d_layer, layer_size);
         } else {
             if (!useRelaxationSharedMem) relaxation_kernel<<<grid, block>>>(d_layer, d_layer_copy, layer_size);
-            else relaxation_kernelsh<<<grid, block, relax_shmem>>>(d_layer, d_layer_copy, layer_size);
+            else relaxation_kernelsh<<<grid, block>>>(d_layer, d_layer_copy, layer_size);
             // Pointer Swap (no cudaMemcpy before relaxation phase)
             float *tmp = d_layer;
             d_layer = d_layer_copy;
