@@ -16,5 +16,6 @@ MPI_OMP_EXTRA_LIBS = -march=native \
 
 # Flags for CUDA code
 # Uncomment and add extra flags if you need them
-CUDA_EXTRA_CFLAGS = -gencode arch=compute_52,code=sm_52 # allow run on gtx 970 
+# CUDA_EXTRA_CFLAGS = -gencode arch=compute_52,code=sm_52 # allow run on gtx 970 
+CUDA_EXTRA_CFLAGS = -O3 
 #CUDA_EXTRA_LIBS =
