@@ -6,17 +6,17 @@
 
 #define BLOCKSIZE 32 // the number of threads per block 
 
+// Notes:
+// - __restrict__  helps the compiler optimize and reduce memory operations. (compiler doesn't worry about pointer aliasing)
+// - __launch_bounds__ helps the compiler by telling it that the kernel won't run with more threads than the specified amount. 
+// 
+
 // Wrapper to CUDA calls, to show errors and avoid having to assign each cuda function to a cudaError_t variable. 
 #define CUDA_CHECK(err) \
     if (err != cudaSuccess) { \
         fprintf(stderr, "CUDA error at %s:%d: %s\n", __FILE__, __LINE__, cudaGetErrorString(err)); \
         exit(EXIT_FAILURE); \
     }
-
-// Improvements for comparison:
-// - AoS -> SoA (+++)
-// - Using __restrict__ (++)
-// - Find max particles per storm Pre Main Loop (+) 
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////// 
 /////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -41,7 +41,9 @@ static void update(
     float attenuacion = sqrtf((float)distance);
     float energy_k = energy / layer_sz / attenuacion;
     if ( energy_k >= THRESHOLD / layer_sz || energy_k <= -THRESHOLD / layer_sz )
-        layer[k] += energy_k;
+        // there is no race-condition because each thread iterates over all particles of the storm and accesses
+        // the global memory on a single layer cell. 
+        layer[k] += energy_k; 
 }
 
 
@@ -68,7 +70,7 @@ int get_max_particles_count(
 /////////////////////////////////////// NO SHARED MEMORY IMPLEMENTATIONS /////////////////////////////////////////////
 
 /**
- * Simple bombardment phase management (no shared memory & no SoA) -> Slowest implementation of the bombardment phase.
+ * Simple bombardment phase management (no shared memory & no SoA).
  * Each thread will update the global memory and the input particles are in AoS format. 
  * Each thread will be responsible for a layer cell and iterate on all the particles of the current wave.
  */
@@ -81,7 +83,7 @@ void bombardment_kernel(
     int particles_sz)
 {
     int layer_idx = threadIdx.x + blockIdx.x * blockDim.x;
-    if (layer_idx >= layer_sz) return; 
+    if (layer_idx >= layer_sz) return;  
 
     // Update the layer cell for all particles in the storm
     for (int i = 0; i < particles_sz; i++){
@@ -93,7 +95,7 @@ void bombardment_kernel(
 
 /**
  * Like @bombardment_kernel but using SoA.
- * This is actually slower than the other one  
+ * The only difference is in the way we access the 
  */
 __global__ 
 __launch_bounds__(BLOCKSIZE)
@@ -115,7 +117,7 @@ void bombardment_kernel_soa(
 }
 
 /**
- * Simple relaxation phase management (no shared memory).
+ * Simple relaxation phase management's kernel (no shared memory).
  * Each thread will be responsible for a layer cell and calculate the average between itself & its 2 neighbours.
  * The 1st and last cells will just copy-paste their own value since they haven't both left & right neighbours. 
  */
@@ -188,7 +190,7 @@ void bombardment_kernelsh(
 
 
 /**
- * A more advanced bombardment phase management (using shared memory & SoA).
+ * A more advanced bombardment phase management kernel (using shared memory & SoA).
  */
 __global__ 
 __launch_bounds__(BLOCKSIZE)
@@ -232,14 +234,12 @@ void bombardment_kernelsh_soa(
 
 
 /**
- * A more advanced relaxation phase management (shared memory).
+ * A more advanced relaxation phase management kernel (shared memory).
  * Each thread will first load into shared memory its own value and if they are at the block's edge, load the ghost values. 
  * Then after synchronizing with the other threads in the block, each thread will update into global memory  
  * the average of itself and neighbours. 
  * The 1st and last cells will just copy-paste their own value since they haven't both left & right neighbours. 
  * 
- * Improvements over @relaxation_kernel:
- * - using shared memory prevents reading from global memory 
  */
 __global__ 
 __launch_bounds__(BLOCKSIZE)
@@ -347,6 +347,7 @@ void core(
     int i, k;
     float *h_layer;
 
+    // Flags for setting up the run  
     bool useSoA = true; // optimal: true
     bool useSoaPinnedMemory = false; // optimal: true
     bool useBombardmentSharedMem = false; // optimal: true
@@ -366,12 +367,14 @@ void core(
     float *d_layer;  float *d_layer_copy;
     CUDA_CHECK(cudaMalloc(&d_layer, sizeof(float) * layer_size)); // one layer for the whole execution
     CUDA_CHECK(cudaMalloc(&d_layer_copy, sizeof(float) * layer_size));
-    CUDA_CHECK(cudaMemset(d_layer, 0, sizeof(float) * layer_size));  // avoid the previous looping for initialization
+    CUDA_CHECK(cudaMemset(d_layer, 0, sizeof(float) * layer_size));  // avoid looping for initialization, just fill the d_layer with zeros
 
     // Grid, Block & Shared Memory sizes 
     dim3 block(BLOCKSIZE);
-    dim3 grid((layer_size + BLOCKSIZE -1) / BLOCKSIZE);
-    size_t bomb_shmem = 2 * BLOCKSIZE * sizeof(int);
+    dim3 grid((layer_size + BLOCKSIZE -1) / BLOCKSIZE);  
+
+    // Shared memory sizes: to be passed in 3rd parameter of the relative kernels
+    size_t bomb_shmem = 2 * BLOCKSIZE * sizeof(int); 
     size_t maxval_shmem = BLOCKSIZE * sizeof(float) + BLOCKSIZE * sizeof(int); 
 
     ///////////////////////// Maxval Alloc (start)
@@ -386,6 +389,8 @@ void core(
     ///////////////////////// Maxval Alloc (end)
 
     ///////////////////////// Max Particles Optimization (start)
+    // We pre calculate the highest particles count by taking into account all the storms.
+    // By this we only need one cudaMalloc instead of a cudaMalloc per storm. 
     int max_particles = get_max_particles_count(num_storms, storms);
     int *d_particles;
     CUDA_CHECK(cudaMalloc(&d_particles, sizeof(int) * max_particles * 2));
@@ -429,6 +434,7 @@ void core(
 
         // ==== SoA Version 
         if (useSoA){
+            // Instead of pvpvpvpv...pv -> pp...ppvv..vv (by using 2 separate variables)
             for (int p = 0; p < n_particles; p++) {
                 h_temp_pos[p] = storms[i].posval[p * 2];     // Position
                 h_temp_val[p] = storms[i].posval[p * 2 + 1]; // Value
@@ -454,6 +460,7 @@ void core(
         } else {
             if (!useRelaxationSharedMem) relaxation_kernel<<<grid, block>>>(d_layer, d_layer_copy, layer_size);
             else relaxation_kernelsh<<<grid, block>>>(d_layer, d_layer_copy, layer_size);
+
             // Pointer Swap (no cudaMemcpy before relaxation phase)
             float *tmp = d_layer;
             d_layer = d_layer_copy;
@@ -468,6 +475,7 @@ void core(
         //////////////////////////////////////////////////////////////////
         // Maximum Value Location Phase 
         if (!useMaxvalSequential) {
+            // We calculate the max for each block 
             maxval_kernelsh<<<grid, block, maxval_shmem>>>(d_layer, layer_size, d_block_max_vals, d_block_max_idxs);
             CUDA_CHECK(cudaGetLastError());
             CUDA_CHECK(cudaDeviceSynchronize());
@@ -476,7 +484,7 @@ void core(
             CUDA_CHECK(cudaMemcpy(h_block_vals, d_block_max_vals, grid.x * sizeof(float), cudaMemcpyDeviceToHost));
             CUDA_CHECK(cudaMemcpy(h_block_idxs, d_block_max_idxs, grid.x * sizeof(int), cudaMemcpyDeviceToHost));
 
-            // Final reduction on CPU 
+            // Final reduction on CPU to find the max of the maxes of blocks.
             float current_max = -FLT_MAX; 
             int current_pos = -1;
 
