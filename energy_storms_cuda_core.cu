@@ -4,7 +4,7 @@
 #include <float.h>
 #include "energy_storms.h"
 
-#define BLOCKSIZE 256// the number of threads per block 
+#define BLOCKSIZE 32 // the number of threads per block 
 
 // Wrapper to CUDA calls, to show errors and avoid having to assign each cuda function to a cudaError_t variable. 
 #define CUDA_CHECK(err) \
@@ -127,7 +127,9 @@ void relaxation_kernel(
     int layer_sz)
 {
     int layer_idx= threadIdx.x + blockIdx.x * blockDim.x;
-    if (layer_idx <= 0 || layer_idx >= layer_sz-1) {
+    if (layer_idx >= layer_sz) return;
+
+    if (layer_idx <= 0 || layer_idx == layer_sz-1) {
         d_layer_out[layer_idx] = d_layer_in[layer_idx]; // first and last should be saved as they are 
         return;
     }
@@ -346,10 +348,10 @@ void core(
     float *h_layer;
 
     bool useSoA = true; // optimal: true
-    bool useSoaPinnedMemory = true; // optimal: true
-    bool useBombardmentSharedMem = true; // optimal: true
+    bool useSoaPinnedMemory = false; // optimal: true
+    bool useBombardmentSharedMem = false; // optimal: true
     bool useRelaxationSharedMem = false; // optimal: false (no real changes)
-    bool useRelaxationSwap = false; // optimal: false (no real changes on gtx970)
+    bool useRelaxationSwap = true; // optimal: false (no real changes on gtx970)
     bool useMaxvalSequential = false; // optimal: true (no real changes on gtx970)
 
     // Sequential code 
