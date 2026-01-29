@@ -161,7 +161,7 @@ void core(int layer_size, int num_storms, Storm *storms, float *maximum, int *po
              *
              * */
             t_comp = MPI_Wtime();
-            #pragma omp parallel for schedule(static)
+            #pragma omp parallel for schedule(runtime)
             for (int k = 1; k <= local_size; k++) {
                 float global_id = (float)(local_start + k - 1);
 
@@ -205,7 +205,7 @@ void core(int layer_size, int num_storms, Storm *storms, float *maximum, int *po
             MPI_Waitall(req_count, request, MPI_STATUSES_IGNORE);
             t_finish = MPI_Wtime();
             local_elapsed = t_finish - t_start;
-#if IS_PROFILING == true
+#if DIS_PROFILING == true
             MPI_Reduce(&local_elapsed, &elapsed, 1, MPI_DOUBLE, MPI_MAX ,0, MPI_COMM_WORLD);
             if(rank == 0) printf("Time for ending the halo exchange: %f\n", elapsed);
 #endif
@@ -226,7 +226,7 @@ void core(int layer_size, int num_storms, Storm *storms, float *maximum, int *po
             #pragma omp parallel default(none) private (k, i) shared(local_size, local_layer, local_layer_copy, maximum, positions, local_max, global_max_pos, local_start, rank)
             {
                 /* 'simd' to vectorializate the operation*/
-                #pragma omp for simd schedule(static)
+                #pragma omp for simd schedule(runtime)
                 for( k=0; k<local_size+2; k++ )
                     local_layer_copy[k] = local_layer[k];
 
@@ -235,7 +235,7 @@ void core(int layer_size, int num_storms, Storm *storms, float *maximum, int *po
                 */
 
                 /* Here the update of the value is done taking in account the two extra cells inside the 'local_layer' and it's ancillary array.*/
-                #pragma omp for schedule(static)
+                #pragma omp for schedule(runtime)
                 for( k=1; k<local_size; k++ ){
                    local_layer[k] = ( local_layer_copy[k-1] + local_layer_copy[k] + local_layer_copy[k+1] ) / 3.0f;
                 }
@@ -245,7 +245,7 @@ void core(int layer_size, int num_storms, Storm *storms, float *maximum, int *po
                  * At the end, outside the loop, with a critical section, we get the 'local_max' and the 'global_max_pos'*/
                float thread_max = -FLT_MAX;
                int thread_max_pos = -1;
-               #pragma omp for schedule(static) nowait
+               #pragma omp for schedule(runtime) nowait
                 for( k=1; k<local_size-1; k++ ) {
                     /* Check it only if it is a local maximum */
                     if ( local_layer[k] > local_layer[k-1] && local_layer[k] > local_layer[k+1] ) {
@@ -274,7 +274,7 @@ void core(int layer_size, int num_storms, Storm *storms, float *maximum, int *po
             t_finish = MPI_Wtime();
             local_elapsed = t_finish - t_start;
 
-#if IS_PROFILING == true
+#if DIS_PROFILING == true
             MPI_Reduce(&local_elapsed, &elapsed, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
             if(rank ==0)printf("The time for AllRecuce: %f\n", elapsed);
 #endif
