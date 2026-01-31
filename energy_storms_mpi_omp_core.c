@@ -21,32 +21,6 @@ struct reductionResult{
  * Is used in the main function, to call the "print_debug" function, in the "energy_storms.h" */
 float *layer = NULL;
 
-/* THIS FUNCTION CAN BE MODIFIED */
-/* Function to update a single position of the layer
- * */
-static float updateControlPoint( float *local_layer, int layer_size, int k, int pos, float energy ) {
-    /* 1. Compute the absolute value of the distance between the
-        impact position and the k-th position of the layer */
-    int distance = pos - k;
-    if ( distance < 0 ) distance = - distance;
-
-    /* 2. Impact cell has a distance value of 1 */
-    distance = distance + 1;
-
-    /* 3. Square root of the distance */
-    /* NOTE: Real world atenuation typically depends on the square of the distance.
-       We use here a tailored equation that affects a much wider range of cells */
-    float atenuacion = sqrtf( (float)distance );
-
-    /* 4. Compute attenuated energy */
-    float energy_k = energy / layer_size / atenuacion;
-
-    /* 5. Do not add if its absolute value is lower than the threshold */
-    if ( energy_k >= THRESHOLD / layer_size || energy_k <= -THRESHOLD / layer_size )
-        return energy_k;
-    return 0.0f;
-}
-
 
 void core(int layer_size, int num_storms, Storm *storms, float *maximum, int *positions) {
     /* Let's define alse here the global comunicator and the rank variables */
@@ -161,14 +135,13 @@ void core(int layer_size, int num_storms, Storm *storms, float *maximum, int *po
              *
              * */
             t_comp = MPI_Wtime();
-            #pragma omp parallel for schedule(dynamic, 64)
+            #pragma omp parallel for schedule(static)
             for (int k = 1; k <= local_size; k++) {
                 float global_id = (float)(local_start + k - 1);
 
                 for (int j = 0; j < s_size; j++) {
                     float distance = fabsf(s_pos[j] - global_id);
 
-                    // VERIFICA QUESTA FORMULA CON IL SEQUENZIALE!
                     float atenuacion = sqrtf(distance + 1.0f);
                     float energy_k = s_en[j] / (float)layer_size / atenuacion;
 
