@@ -135,7 +135,7 @@ void core(int layer_size, int num_storms, Storm *storms, float *maximum, int *po
              *
              * */
             t_comp = MPI_Wtime();
-            #pragma omp parallel for schedule(static)
+            #pragma omp parallel for schedule(guided)
             for (int k = 1; k <= local_size; k++) {
                 float global_id = (float)(local_start + k - 1);
 
